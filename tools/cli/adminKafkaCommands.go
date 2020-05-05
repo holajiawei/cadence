@@ -529,6 +529,8 @@ func doRereplicate(shardID int, domainID, wid, rid string, minID, maxID int64, t
 			BranchToken:         exeInfo.BranchToken,
 		}
 
+		versionHistories := resp.State.VersionHistories
+
 		_, historyBatches, err := history.GetAllHistory(historyV2Mgr, nil, true,
 			minID, maxID, exeInfo.BranchToken, common.IntPtr(shardID))
 
@@ -561,7 +563,14 @@ func doRereplicate(shardID int, domainID, wid, rid string, minID, maxID int64, t
 			taskTemplate.Version = firstEvent.GetVersion()
 			taskTemplate.FirstEventID = firstEvent.GetEventId()
 			taskTemplate.NextEventID = lastEvent.GetEventId() + 1
-			task, _, err := history.GenerateReplicationTask(targets, taskTemplate, historyV2Mgr, nil, batch, common.IntPtr(shardID))
+			var err error
+			var task *replicator.ReplicationTask
+			if versionHistories == nil {
+				task, _, err = history.GenerateReplicationTask(targets, taskTemplate, historyV2Mgr, nil, batch, common.IntPtr(shardID))
+			} else {
+				task, err = history.GenerateHistoryV2ReplicationTask(historyV2Mgr, shardID, taskTemplate, versionHistories)
+			}
+
 			if err != nil {
 				ErrorAndExit("GenerateReplicationTask error", err)
 			}

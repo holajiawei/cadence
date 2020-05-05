@@ -323,6 +323,70 @@ func GenerateReplicationTask(
 	return ret, newRunID, nil
 }
 
+// GenerateHistoryV2ReplicationTask generate replication task with history v2 replication tasks
+func GenerateHistoryV2ReplicationTask(
+	historyV2Mgr persistence.HistoryManager,
+	shardID int,
+	task *persistence.ReplicationTaskInfo,
+	versionHistories *persistence.VersionHistories,
+) (*replicator.ReplicationTask, error) {
+
+	// NDC workflow
+	versionHistoryItems, branchToken, err := getVersionHistoryItems(
+		versionHistories,
+		task.FirstEventID,
+		task.GetVersion(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// BranchToken will not set in get dlq replication message request
+	if len(task.BranchToken) == 0 {
+		task.BranchToken = branchToken
+	}
+
+	eventsBlob, err := getEventsBlob(
+		historyV2Mgr,
+		shardID,
+		task.BranchToken,
+		task.FirstEventID,
+		task.NextEventID,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var newRunEventsBlob *shared.DataBlob
+	if len(task.NewRunBranchToken) != 0 {
+		// only get the first batch
+		newRunEventsBlob, err = getEventsBlob(
+			historyV2Mgr,
+			shardID,
+			task.NewRunBranchToken,
+			common.FirstEventID,
+			common.FirstEventID+1,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	replicationTask := &replicator.ReplicationTask{
+		TaskType: replicator.ReplicationTaskType.Ptr(replicator.ReplicationTaskTypeHistoryV2),
+		HistoryTaskV2Attributes: &replicator.HistoryTaskV2Attributes{
+			TaskId:              common.Int64Ptr(task.FirstEventID),
+			DomainId:            common.StringPtr(task.GetDomainID()),
+			WorkflowId:          common.StringPtr(task.GetWorkflowID()),
+			RunId:               common.StringPtr(task.GetRunID()),
+			VersionHistoryItems: versionHistoryItems,
+			Events:              eventsBlob,
+			NewRunEvents:        newRunEventsBlob,
+		},
+	}
+	return replicationTask, nil
+}
+
 func (p *replicatorQueueProcessorImpl) readTasks(readLevel int64) ([]task.Info, bool, error) {
 	return p.readTasksWithBatchSize(readLevel, p.options.BatchSize())
 }
@@ -661,61 +725,19 @@ func (p *replicatorQueueProcessorImpl) generateHistoryReplicationTask(
 				return replicationTask, err
 			}
 
-			// NDC workflow
-			versionHistoryItems, branchToken, err := p.getVersionHistoryItems(
-				mutableState,
-				task.FirstEventID,
-				task.Version,
+			return GenerateHistoryV2ReplicationTask(
+				p.historyV2Mgr,
+				p.shard.GetShardID(),
+				task,
+				versionHistories,
 			)
-			if err != nil {
-				return nil, err
-			}
-
-			// BranchToken will not set in get dlq replication message request
-			if len(task.BranchToken) == 0 {
-				task.BranchToken = branchToken
-			}
-
-			eventsBlob, err := p.getEventsBlob(
-				task.BranchToken,
-				task.FirstEventID,
-				task.NextEventID,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			var newRunEventsBlob *shared.DataBlob
-			if len(task.NewRunBranchToken) != 0 {
-				// only get the first batch
-				newRunEventsBlob, err = p.getEventsBlob(
-					task.NewRunBranchToken,
-					common.FirstEventID,
-					common.FirstEventID+1,
-				)
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			replicationTask := &replicator.ReplicationTask{
-				TaskType: replicator.ReplicationTaskType.Ptr(replicator.ReplicationTaskTypeHistoryV2),
-				HistoryTaskV2Attributes: &replicator.HistoryTaskV2Attributes{
-					TaskId:              common.Int64Ptr(task.FirstEventID),
-					DomainId:            common.StringPtr(task.DomainID),
-					WorkflowId:          common.StringPtr(task.WorkflowID),
-					RunId:               common.StringPtr(task.RunID),
-					VersionHistoryItems: versionHistoryItems,
-					Events:              eventsBlob,
-					NewRunEvents:        newRunEventsBlob,
-				},
-			}
-			return replicationTask, nil
 		},
 	)
 }
 
-func (p *replicatorQueueProcessorImpl) getEventsBlob(
+func getEventsBlob(
+	historyV2Mgr persistence.HistoryManager,
+	shardID int,
 	branchToken []byte,
 	firstEventID int64,
 	nextEventID int64,
@@ -729,11 +751,11 @@ func (p *replicatorQueueProcessorImpl) getEventsBlob(
 		MaxEventID:    nextEventID,
 		PageSize:      1,
 		NextPageToken: pageToken,
-		ShardID:       common.IntPtr(p.shard.GetShardID()),
+		ShardID:       common.IntPtr(shardID),
 	}
 
 	for {
-		resp, err := p.historyV2Mgr.ReadRawHistoryBranch(req)
+		resp, err := historyV2Mgr.ReadRawHistoryBranch(req)
 		if err != nil {
 			return nil, err
 		}
@@ -755,13 +777,12 @@ func (p *replicatorQueueProcessorImpl) getEventsBlob(
 	return eventBatchBlobs[0].ToThrift(), nil
 }
 
-func (p *replicatorQueueProcessorImpl) getVersionHistoryItems(
-	mutableState execution.MutableState,
+func getVersionHistoryItems(
+	versionHistories *persistence.VersionHistories,
 	eventID int64,
 	version int64,
 ) ([]*shared.VersionHistoryItem, []byte, error) {
 
-	versionHistories := mutableState.GetVersionHistories()
 	if versionHistories == nil {
 		return nil, nil, &shared.InternalServiceError{
 			Message: "replicatorQueueProcessor encounter workflow without version histories",
